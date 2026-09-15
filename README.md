@@ -1,16 +1,16 @@
 ---
-title: Green iFVG Screener
+title: iFVG Screener
 emoji: 🟢
 colorFrom: green
-colorTo: slate
+colorTo: red
 sdk: docker
 app_port: 8501
 pinned: false
 ---
 
-# Green iFVG screener
+# iFVG screener
 
-Streamlit daily screener for bullish inversion FVGs (LuxAlgo IFVG). Universe = S&P 500 ∪ Nasdaq-100. Hits Yahoo for prices / EPS on first load (price parquet cache is local-only and not shipped).
+Streamlit daily screener for inversion FVGs (LuxAlgo IFVG). **Bull** = green iFVG (support) + optional EPS surprise > 0. **Bear** = red iFVG (resistance) + optional EPS surprise < 0. Universe = S&P 500 ∪ Nasdaq-100. Hits Yahoo for prices / EPS on first load (price parquet cache is local-only and not shipped).
 
 ## Local
 

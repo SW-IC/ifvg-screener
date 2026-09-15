@@ -7,9 +7,13 @@ Green / bullish IFVG = a bearish FVG that price inverted (body traded
 through the top). Active zone is then support until the body trades
 fully below the bottom.
 
-"Touch" = the as-of daily candle range overlaps a still-valid green IFVG.
-Lookback N drops the last N sessions (0 = latest bar) so the scan is
-what the filters would have printed that day.
+Red / bearish IFVG = a bullish FVG that price inverted (body traded
+through the bottom). Active zone is then resistance until the body
+trades fully above the top.
+
+"Touch" = the as-of daily candle range overlaps a still-valid IFVG of
+the requested mode. Lookback N drops the last N sessions (0 = latest
+bar) so the scan is what the filters would have printed that day.
 """
 
 from __future__ import annotations
@@ -196,6 +200,39 @@ def last_confirmed_swing_low(
     return None
 
 
+def last_confirmed_swing_high(
+    high: np.ndarray,
+    dates: pd.DatetimeIndex,
+    last: int,
+    left: int = SWING_LEFT,
+    right: int = SWING_RIGHT,
+) -> dict | None:
+    """Most recent 5-bar swing high fully confirmed before `last`.
+
+    Pivot at i: `high[i]` is strictly the highest of `[i-left, i+right]`.
+    Confirmed on bar i+right. Last bar is not used as confirmation.
+    """
+    end = last - right - 1
+    if end < left:
+        return None
+    for i in range(end, left - 1, -1):
+        pivot = high[i]
+        ok = True
+        for k in range(i - left, i + right + 1):
+            if k == i:
+                continue
+            if high[k] >= pivot:
+                ok = False
+                break
+        if ok:
+            return {
+                "i": int(i),
+                "price": float(pivot),
+                "date": dates[i].date().isoformat(),
+            }
+    return None
+
+
 def nearest_red_above(red_zones: list, close: float) -> dict | None:
     """Closest still-valid red iFVG at or above close.
 
@@ -212,6 +249,27 @@ def nearest_red_above(red_zones: list, close: float) -> dict | None:
         if bot <= close:
             return {"pct": 0.0, "bot": bot, "top": top}
         pct = (bot - close) / close * 100.0
+        if best is None or pct < best["pct"]:
+            best = {"pct": float(pct), "bot": bot, "top": top}
+    return best
+
+
+def nearest_green_below(green_zones: list, close: float) -> dict | None:
+    """Closest still-valid green iFVG at or below close.
+
+    Profit window = % from close down to that zone's top (0 if close is
+    already inside the green). None if no green sits below price.
+    """
+    if not close or not green_zones:
+        return None
+    best = None
+    for z in green_zones:
+        bot, top = float(z["bot"]), float(z["top"])
+        if bot > close:
+            continue
+        if top >= close:
+            return {"pct": 0.0, "bot": bot, "top": top}
+        pct = (close - top) / close * 100.0
         if best is None or pct < best["pct"]:
             best = {"pct": float(pct), "bot": bot, "top": top}
     return best
@@ -273,8 +331,12 @@ def scan_ifvg(
     include_ohlc: bool = True,
     lookback: int = 0,
     as_of=None,
+    mode: str = "bull",
 ) -> dict:
-    """Run IFVG on an OHLC daily frame. Index should be dates."""
+    """Run IFVG on an OHLC daily frame. Index should be dates.
+
+    mode: "bull" = touch still-valid green iFVGs; "bear" = red iFVGs.
+    """
     df = apply_lookback(df, lookback, as_of=as_of)
     if df is None or df.empty:
         return {"ok": False, "reason": "too few bars"}
@@ -350,12 +412,18 @@ def scan_ifvg(
     last_open = o[last]
     last_date = dates[last]
     ssl = last_confirmed_swing_low(l, dates, last)
+    ssh = last_confirmed_swing_high(h, dates, last)
     sweep = bool(
         ssl is not None and last_low < ssl["price"] and last_close > ssl["price"]
+    )
+    sweep_high = bool(
+        ssh is not None and last_high > ssh["price"] and last_close < ssh["price"]
     )
     rsi_arr = _wilder_rsi(c)
     rsi = float(rsi_arr[last]) if not np.isnan(rsi_arr[last]) else None
     rsi_dist_30 = None if rsi is None else float(rsi - 30.0)
+    rsi_dist_70 = None if rsi is None else float(rsi - 70.0)
+    side = "bear" if str(mode).lower() == "bear" else "bull"
 
     def _zone_dict(v: FVG, kind: str) -> dict:
         sigs = []
@@ -383,14 +451,12 @@ def scan_ifvg(
     green_zones = [_zone_dict(v, "green") for v in bear_inv if v.dir == 1 and v.state >= 1]
     red_zones = [_zone_dict(v, "red") for v in bull_inv if v.dir == -1 and v.state >= 1]
     red_above = nearest_red_above(red_zones, float(last_close))
+    green_below = nearest_green_below(green_zones, float(last_close))
 
-    touches = []
-    for v in bear_inv:
-        if v.dir != 1 or v.state < 1:
-            continue
+    def _touch_row(v: FVG, kind: str) -> dict | None:
         overlaps = last_high >= v.bot and last_low <= v.top
         if not overlaps:
-            continue
+            return None
         body_lo, body_hi = min(last_open, last_close), max(last_open, last_close)
         inside_close = v.bot <= last_close <= v.top
         wick_only = overlaps and not (body_lo <= v.top and body_hi >= v.bot)
@@ -404,38 +470,66 @@ def scan_ifvg(
         else:
             dist_zone_pct = (v.bot - last_close) / last_close * 100.0
         zone_w_pct = (v.top - v.bot) / last_close * 100.0 if last_close else 0.0
-        signaled_today = any(s["i"] == last and s["dir"] == 1 for s in v.signals)
-        touches.append(
-            {
-                "kind": "green_ifvg",
-                "top": v.top,
-                "bot": v.bot,
-                "mid": v.mid,
-                "formed": dates[v.left_i].date().isoformat(),
-                "inverted": dates[v.x_val_i].date().isoformat() if v.x_val_i is not None else None,
-                "age_inv_bars": int(age_inv),
-                "age_fvg_bars": int(age_fvg),
-                "inside_close": bool(inside_close),
-                "wick_only": bool(wick_only),
-                "dist_mid_pct": float(dist_mid_pct),
-                "dist_zone_pct": float(dist_zone_pct),
-                "zone_w_pct": float(zone_w_pct),
-                "lux_bull_signal": bool(signaled_today),
-                "bear_above_pct": None if red_above is None else float(red_above["pct"]),
-                "bear_bot": None if red_above is None else float(red_above["bot"]),
-                "bear_top": None if red_above is None else float(red_above["top"]),
-                "sweep": bool(sweep),
-                "sweep_in_zone": bool(sweep and inside_close),
-                "swing_low": None if ssl is None else float(ssl["price"]),
-                "swing_date": None if ssl is None else ssl["date"],
-                "swing_i": None if ssl is None else int(ssl["i"]),
-                "rsi": rsi,
-                "rsi_dist_30": rsi_dist_30,
-            }
-        )
+        want_dir = 1 if kind == "green_ifvg" else -1
+        signaled_today = any(s["i"] == last and s["dir"] == want_dir for s in v.signals)
+        if kind == "green_ifvg":
+            sweep_now = sweep
+            swing = ssl
+        else:
+            sweep_now = sweep_high
+            swing = ssh
+        return {
+            "kind": kind,
+            "top": v.top,
+            "bot": v.bot,
+            "mid": v.mid,
+            "formed": dates[v.left_i].date().isoformat(),
+            "inverted": dates[v.x_val_i].date().isoformat() if v.x_val_i is not None else None,
+            "age_inv_bars": int(age_inv),
+            "age_fvg_bars": int(age_fvg),
+            "inside_close": bool(inside_close),
+            "wick_only": bool(wick_only),
+            "dist_mid_pct": float(dist_mid_pct),
+            "dist_zone_pct": float(dist_zone_pct),
+            "zone_w_pct": float(zone_w_pct),
+            "lux_bull_signal": bool(signaled_today) if kind == "green_ifvg" else False,
+            "lux_bear_signal": bool(signaled_today) if kind == "red_ifvg" else False,
+            "bear_above_pct": None if red_above is None else float(red_above["pct"]),
+            "bear_bot": None if red_above is None else float(red_above["bot"]),
+            "bear_top": None if red_above is None else float(red_above["top"]),
+            "green_below_pct": None if green_below is None else float(green_below["pct"]),
+            "green_bot": None if green_below is None else float(green_below["bot"]),
+            "green_top": None if green_below is None else float(green_below["top"]),
+            "sweep": bool(sweep_now),
+            "sweep_in_zone": bool(sweep_now and inside_close),
+            "swing_low": None if ssl is None else float(ssl["price"]),
+            "swing_high": None if ssh is None else float(ssh["price"]),
+            "swing_date": None if swing is None else swing["date"],
+            "swing_i": None if swing is None else int(swing["i"]),
+            "rsi": rsi,
+            "rsi_dist_30": rsi_dist_30,
+            "rsi_dist_70": rsi_dist_70,
+        }
+
+    green_touches = []
+    for v in bear_inv:
+        if v.dir != 1 or v.state < 1:
+            continue
+        row = _touch_row(v, "green_ifvg")
+        if row:
+            green_touches.append(row)
+    red_touches = []
+    for v in bull_inv:
+        if v.dir != -1 or v.state < 1:
+            continue
+        row = _touch_row(v, "red_ifvg")
+        if row:
+            red_touches.append(row)
+    touches = red_touches if side == "bear" else green_touches
 
     return {
         "ok": True,
+        "mode": side,
         "last_date": last_date.date().isoformat(),
         "last_close": float(last_close),
         "last_open": float(last_open),
@@ -450,12 +544,18 @@ def scan_ifvg(
         "green_zones": green_zones,
         "red_zones": red_zones,
         "nearest_red": red_above,
+        "nearest_green": green_below,
         "sweep": bool(sweep),
+        "sweep_high": bool(sweep_high),
         "swing_low": None if ssl is None else float(ssl["price"]),
+        "swing_high": None if ssh is None else float(ssh["price"]),
         "swing_date": None if ssl is None else ssl["date"],
+        "swing_high_date": None if ssh is None else ssh["date"],
         "swing_i": None if ssl is None else int(ssl["i"]),
+        "swing_high_i": None if ssh is None else int(ssh["i"]),
         "rsi": rsi,
         "rsi_dist_30": rsi_dist_30,
+        "rsi_dist_70": rsi_dist_70,
         "ohlc": (
             df[[mapping["Open"], mapping["High"], mapping["Low"], mapping["Close"]]].copy()
             if include_ohlc

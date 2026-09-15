@@ -1,6 +1,7 @@
 """Yahoo EPS surprise — same source and rule as Flow B.
 
-Flow B: skip unless Yahoo EPS surprise on the last reported print is > 0.
+Bull: skip unless Yahoo EPS surprise on the last reported print is > 0.
+Bear: skip unless that surprise is < 0.
 Missing estimate = skip. Stored as a ratio (6.74% → 0.0674).
 
 Reads Flow B's pickle if present; fills holes into this app's cache.
@@ -160,8 +161,10 @@ def print_row(recs: dict, as_of: str) -> dict:
     rec = last_reported_print(recs, as_of)
     surprise = None if rec is None else rec.get("surprise")
     beat = surprise is not None and surprise > 0
+    miss = surprise is not None and surprise < 0
     return {
         "eps_date": None if rec is None else rec["date"],
         "eps_surprise": surprise,
         "eps_beat": bool(beat),
+        "eps_miss": bool(miss),
     }

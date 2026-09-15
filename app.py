@@ -1,4 +1,4 @@
-"""Green iFVG daily screener — S&P 500 ∪ Nasdaq-100.
+"""iFVG daily screener (bull green / bear red) — S&P 500 ∪ Nasdaq-100.
 
 Launch:
     streamlit run app.py
@@ -24,7 +24,7 @@ from liquidity import attach_liquidity
 from prices import download_daily
 from universe import load_universe
 
-st.set_page_config(page_title="Green iFVG screener", layout="wide")
+st.set_page_config(page_title="iFVG screener", layout="wide")
 st.markdown(
     """
     <style>
@@ -35,15 +35,16 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("Green iFVG screener")
-st.caption(
-    "Daily candles overlapping an active **bullish inversion FVG** "
-    "(LuxAlgo IFVG: inverted bearish FVG, still valid). "
-    "Universe = S&P 500 ∪ Nasdaq-100."
-)
-
 with st.sidebar:
     st.header("Scan")
+    mode_choice = st.radio(
+        "Mode",
+        ["Bull (green iFVG)", "Bear (red iFVG)"],
+        index=0,
+        horizontal=True,
+        help="Bull = inverted bearish FVG as support. Bear = inverted bullish FVG as resistance.",
+    )
+    bear = mode_choice.startswith("Bear")
     universe_choice = st.selectbox(
         "Universe",
         ["S&P 500 ∪ Nasdaq-100", "S&P 500", "Nasdaq-100"],
@@ -70,21 +71,32 @@ with st.sidebar:
     )
     if show_lux:
         signal_pref = st.selectbox("Signal preference (LuxAlgo)", ["Close", "Wick"], index=0)
-        only_signal = st.checkbox("LuxAlgo bullish signal today only", value=False)
+        only_signal = st.checkbox(
+            "LuxAlgo bearish signal today only" if bear else "LuxAlgo bullish signal today only",
+            value=False,
+            key="only_signal",
+        )
     else:
         signal_pref = "Close"
         only_signal = False
     only_sweep = st.checkbox(
-        "Liquidity sweep (5-bar swing low)",
+        "Liquidity sweep (5-bar swing high)" if bear else "Liquidity sweep (5-bar swing low)",
         value=False,
-        help="Last bar Low undercuts the most recent confirmed 5-bar swing low, Close reclaims that swing, and Close sits inside the green iFVG.",
-    )
-    require_eps_beat = st.checkbox(
-        "Require previous EPS surprise > 0",
-        value=False,
+        key="only_sweep",
         help=(
-            "Last reported Yahoo EPS surprise (the print already out) must be > 0. "
-            "Missing estimate = skip. Same rule as Flow B. EPS vs consensus, not GAAP."
+            "Last bar High exceeds the most recent confirmed 5-bar swing high, Close reclaims that swing, and Close sits inside the red iFVG."
+            if bear
+            else "Last bar Low undercuts the most recent confirmed 5-bar swing low, Close reclaims that swing, and Close sits inside the green iFVG."
+        ),
+    )
+    require_eps = st.checkbox(
+        "Require previous EPS surprise < 0" if bear else "Require previous EPS surprise > 0",
+        value=False,
+        key="require_eps",
+        help=(
+            "Last reported Yahoo EPS surprise (the print already out) must be "
+            + ("< 0. " if bear else "> 0. ")
+            + "Missing estimate = skip. Same source as Flow B. EPS vs consensus, not GAAP."
         ),
     )
     max_gap = st.slider(
@@ -95,21 +107,31 @@ with st.sidebar:
         step=0.5,
         help="0 = close must sit inside the zone. 2 = close can sit up to 2% outside the IFVG and still count as a touch (wicks).",
     )
-    min_bear = st.slider(
-        "Min % to nearest red iFVG",
+    min_opp = st.slider(
+        "Min % to nearest green iFVG" if bear else "Min % to nearest red iFVG",
         min_value=0.0,
         max_value=50.0,
         value=10.0,
         step=1.0,
-        help="Profit window: keep names whose next bearish iFVG (resistance above close) is at least this far. No red above = passes. 0 = off.",
+        key="min_opp",
+        help=(
+            "Profit window: keep names whose next bullish iFVG (support below close) is at least this far. No green below = passes. 0 = off."
+            if bear
+            else "Profit window: keep names whose next bearish iFVG (resistance above close) is at least this far. No red above = passes. 0 = off."
+        ),
     )
     max_rsi_dist = st.slider(
-        "Max distance from RSI 30",
+        "Max distance from RSI 70" if bear else "Max distance from RSI 30",
         min_value=0,
         max_value=70,
         value=70,
         step=1,
-        help="Wilder RSI(14). Distance = RSI − 30. Keep if RSI ≤ 30 + this. 0 = RSI ≤ 30. 70 = off (RSI ≤ 100). RSI below 30 always passes.",
+        key="max_rsi_dist",
+        help=(
+            "Wilder RSI(14). Distance = 70 − RSI. Keep if RSI ≥ 70 − this. 0 = RSI ≥ 70. 70 = off (RSI ≥ 0). RSI above 70 always passes."
+            if bear
+            else "Wilder RSI(14). Distance = RSI − 30. Keep if RSI ≤ 30 + this. 0 = RSI ≤ 30. 70 = off (RSI ≤ 100). RSI below 30 always passes."
+        ),
     )
     st.subheader("Liquidity (options)")
     min_mktcap_bn = st.number_input(
@@ -130,6 +152,21 @@ with st.sidebar:
     )
     nearest_only = st.checkbox("One row per ticker (nearest zone)", value=True)
     run = st.button("Scan", type="primary", use_container_width=True)
+
+if bear:
+    st.title("Red iFVG screener")
+    st.caption(
+        "Daily candles overlapping an active **bearish inversion FVG** "
+        "(LuxAlgo IFVG: inverted bullish FVG, still valid). "
+        "Universe = S&P 500 ∪ Nasdaq-100."
+    )
+else:
+    st.title("Green iFVG screener")
+    st.caption(
+        "Daily candles overlapping an active **bullish inversion FVG** "
+        "(LuxAlgo IFVG: inverted bearish FVG, still valid). "
+        "Universe = S&P 500 ∪ Nasdaq-100."
+    )
 
 UNI_KEY = {
     "S&P 500 ∪ Nasdaq-100": "union",
@@ -224,7 +261,13 @@ def _bar_ts(index, i: int):
     return index[i]
 
 
-def _chart(result: dict, ticker: str, show_last: int = 5, show_signals: bool = False) -> go.Figure:
+def _chart(
+    result: dict,
+    ticker: str,
+    show_last: int = 5,
+    show_signals: bool = False,
+    bear: bool = False,
+) -> go.Figure:
     ohlc_full = result["ohlc"]
     dates = ohlc_full.index
     greens = _last_n(result.get("green_zones") or [], show_last)
@@ -337,28 +380,36 @@ def _chart(result: dict, ticker: str, show_last: int = 5, show_signals: bool = F
             )
         )
 
-    ssl = result.get("swing_low")
-    si = result.get("swing_i")
-    if ssl is not None:
+    if bear:
+        sw_px = result.get("swing_high")
+        si = result.get("swing_high_i")
+        sw_name = "5-bar swing high"
+        sw_color = "#eb6f92"
+    else:
+        sw_px = result.get("swing_low")
+        si = result.get("swing_i")
+        sw_name = "5-bar swing low"
+        sw_color = "#f6c177"
+    if sw_px is not None:
         fig.add_shape(
             type="line",
             xref="x",
             yref="y",
             x0=vis0,
             x1=vis1,
-            y0=ssl,
-            y1=ssl,
-            line=dict(color="#f6c177", dash="dot", width=1),
+            y0=sw_px,
+            y1=sw_px,
+            line=dict(color=sw_color, dash="dot", width=1),
             layer="below",
         )
         if si is not None and 0 <= int(si) < n:
             fig.add_trace(
                 go.Scatter(
                     x=[dates[int(si)]],
-                    y=[ssl],
+                    y=[sw_px],
                     mode="markers",
-                    marker=dict(symbol="diamond", size=8, color="#f6c177", line=dict(width=0)),
-                    name="5-bar swing low",
+                    marker=dict(symbol="diamond", size=8, color=sw_color, line=dict(width=0)),
+                    name=sw_name,
                     hoverinfo="skip",
                 )
             )
@@ -387,6 +438,7 @@ def _scan_kwargs(meta: dict | None = None, **extra) -> dict:
         "signal_pref": extra.get("signal_pref", meta.get("signal_pref", "Close")),
         "lookback": int(extra.get("lookback", meta.get("lookback", 0))),
         "as_of": extra.get("as_of", meta.get("as_of")),
+        "mode": extra.get("mode", meta.get("mode", "bull")),
     }
     return out
 
@@ -397,9 +449,11 @@ def _run_scan(
     atr_multi: float,
     signal_pref: str,
     lookback: int = 1,
+    mode: str = "bull",
 ) -> pd.DataFrame:
     rows = []
     as_of = universe_as_of(frames, int(lookback))
+    side = "bear" if str(mode).lower() == "bear" else "bull"
     for t, df in frames.items():
         try:
             res = scan_ifvg(
@@ -409,12 +463,14 @@ def _run_scan(
                 include_ohlc=False,
                 lookback=int(lookback),
                 as_of=as_of,
+                mode=side,
             )
         except Exception:
             continue
         if not res.get("ok") or not res.get("touches"):
             continue
         for z in res["touches"]:
+            lux = z.get("lux_bear_signal") if side == "bear" else z.get("lux_bull_signal")
             rows.append(
                 {
                     "ticker": t,
@@ -433,16 +489,21 @@ def _run_scan(
                     "inverted": z["inverted"],
                     "formed": z["formed"],
                     "age_inv": z["age_inv_bars"],
-                    "lux_signal": z["lux_bull_signal"],
+                    "lux_signal": bool(lux),
                     "bear_above_%": None if z.get("bear_above_pct") is None else round(z["bear_above_pct"], 2),
                     "bear_bot": z.get("bear_bot"),
                     "bear_top": z.get("bear_top"),
+                    "green_below_%": None if z.get("green_below_pct") is None else round(z["green_below_pct"], 2),
+                    "green_bot": z.get("green_bot"),
+                    "green_top": z.get("green_top"),
                     "sweep": z.get("sweep", False),
                     "sweep_in_zone": z.get("sweep_in_zone", False),
                     "swing_low": z.get("swing_low"),
+                    "swing_high": z.get("swing_high"),
                     "swing_date": z.get("swing_date"),
                     "rsi": None if z.get("rsi") is None else round(z["rsi"], 1),
                     "rsi_dist_30": None if z.get("rsi_dist_30") is None else round(z["rsi_dist_30"], 1),
+                    "rsi_dist_70": None if z.get("rsi_dist_70") is None else round(z["rsi_dist_70"], 1),
                 }
             )
     if not rows:
@@ -468,7 +529,7 @@ def _attach_eps(hits: pd.DataFrame, fetch_missing: bool) -> pd.DataFrame:
     extra = pd.DataFrame.from_dict(rows, orient="index")
     extra.index.name = "ticker"
     extra = extra.reset_index()
-    drop = [c for c in ("eps_date", "eps_surprise", "eps_beat") if c in hits.columns]
+    drop = [c for c in ("eps_date", "eps_surprise", "eps_beat", "eps_miss") if c in hits.columns]
     if drop:
         hits = hits.drop(columns=drop)
     return hits.merge(extra, on="ticker", how="left")
@@ -481,7 +542,14 @@ if run:
     t0 = time.time()
     frames = _prices(tickers, period, key)
     members = {"sp500": set(uni["sp500"]), "ndx100": set(uni["ndx100"])}
-    hits = _run_scan(frames, members, float(atr_multi), signal_pref, lookback=int(lookback))
+    hits = _run_scan(
+        frames,
+        members,
+        float(atr_multi),
+        signal_pref,
+        lookback=int(lookback),
+        mode="bear" if bear else "bull",
+    )
     hits = _attach_eps(hits, fetch_missing=True)
     as_of = universe_as_of(frames, int(lookback))
     hits = attach_liquidity(hits, frames, as_of=as_of, fetch_mktcap=True)
@@ -495,12 +563,40 @@ if run:
         "atr_multi": atr_multi,
         "signal_pref": signal_pref,
         "lookback": int(lookback),
+        "mode": "bear" if bear else "bull",
         "as_of": None if as_of is None else pd.Timestamp(as_of).date().isoformat(),
         "uni": uni,
     }
 
 hits = st.session_state.get("hits")
 meta = st.session_state.get("scan_meta")
+want_mode = "bear" if bear else "bull"
+if (
+    hits is not None
+    and meta is not None
+    and (meta.get("mode") or "bull") != want_mode
+    and st.session_state.get("frames")
+):
+    frames = st.session_state["frames"]
+    uni = meta.get("uni") or {}
+    members = {"sp500": set(uni.get("sp500") or []), "ndx100": set(uni.get("ndx100") or [])}
+    t0 = time.time()
+    hits = _run_scan(
+        frames,
+        members,
+        float(meta.get("atr_multi", atr_multi)),
+        meta.get("signal_pref", signal_pref),
+        lookback=int(meta.get("lookback", lookback)),
+        mode=want_mode,
+    )
+    hits = _attach_eps(hits, fetch_missing=True)
+    as_of = universe_as_of(frames, int(meta.get("lookback", lookback)))
+    hits = attach_liquidity(hits, frames, as_of=as_of, fetch_mktcap=True)
+    meta = dict(meta)
+    meta["mode"] = want_mode
+    meta["elapsed"] = time.time() - t0
+    st.session_state["hits"] = hits
+    st.session_state["scan_meta"] = meta
 
 if hits is not None and not hits.empty and "sweep" not in hits.columns:
     frames = st.session_state.get("frames") or {}
@@ -574,9 +670,56 @@ if hits is not None and not hits.empty and "rsi" not in hits.columns:
         hits = hits.merge(extra, on="ticker", how="left")
         st.session_state["hits"] = hits
 
-if hits is not None and not hits.empty and "eps_beat" not in hits.columns:
-    hits = _attach_eps(hits, fetch_missing=bool(require_eps_beat))
+if hits is not None and not hits.empty and (
+    "eps_beat" not in hits.columns or "eps_miss" not in hits.columns
+):
+    hits = _attach_eps(hits, fetch_missing=bool(require_eps))
     st.session_state["hits"] = hits
+
+if hits is not None and not hits.empty and "green_below_%" not in hits.columns:
+    frames = st.session_state.get("frames") or {}
+    cache = {}
+    for t in hits["ticker"].unique():
+        if t not in frames:
+            continue
+        try:
+            r = scan_ifvg(frames[t], include_ohlc=False, **_scan_kwargs(meta))
+        except Exception:
+            continue
+        ng = r.get("nearest_green")
+        cache[t] = {
+            "green_below_%": None if not ng else round(ng["pct"], 2),
+            "green_bot": None if not ng else ng["bot"],
+            "green_top": None if not ng else ng["top"],
+        }
+    if cache:
+        extra = pd.DataFrame.from_dict(cache, orient="index")
+        extra.index.name = "ticker"
+        extra = extra.reset_index()
+        hits = hits.merge(extra, on="ticker", how="left")
+        st.session_state["hits"] = hits
+
+if hits is not None and not hits.empty and "rsi_dist_70" not in hits.columns:
+    frames = st.session_state.get("frames") or {}
+    cache = {}
+    for t in hits["ticker"].unique():
+        if t not in frames:
+            continue
+        try:
+            r = scan_ifvg(frames[t], include_ohlc=False, **_scan_kwargs(meta))
+        except Exception:
+            continue
+        dist = r.get("rsi_dist_70")
+        cache[t] = {
+            "rsi_dist_70": None if dist is None else round(float(dist), 1),
+            "swing_high": r.get("swing_high"),
+        }
+    if cache:
+        extra = pd.DataFrame.from_dict(cache, orient="index")
+        extra.index.name = "ticker"
+        extra = extra.reset_index()
+        hits = hits.merge(extra, on="ticker", how="left")
+        st.session_state["hits"] = hits
 
 if hits is not None and not hits.empty and "adv_m" not in hits.columns:
     frames = st.session_state.get("frames") or {}
@@ -591,8 +734,9 @@ if hits is None:
 if hits.empty:
     as_of_txt = (meta or {}).get("as_of") or (hits["date"].iloc[0] if hits is not None and not hits.empty else "as-of bar")
     lb = int((meta or {}).get("lookback", 0))
+    zone_name = "red iFVG" if bear else "green iFVG"
     st.warning(
-        f"No names overlapping an active green iFVG on {as_of_txt}"
+        f"No names overlapping an active {zone_name} on {as_of_txt}"
         f" (lookback {lb})."
     )
     st.stop()
@@ -604,20 +748,26 @@ if only_sweep:
     col = "sweep_in_zone" if "sweep_in_zone" in view.columns else "sweep"
     view = view[view[col].fillna(False)]
 view = view[view["dist_zone_%"] <= float(max_gap)]
-if float(min_bear) > 0 and "bear_above_%" in view.columns and not view.empty:
-    bear = view["bear_above_%"]
-    view = view[bear.isna() | (bear >= float(min_bear))]
+opp_col = "green_below_%" if bear else "bear_above_%"
+if float(min_opp) > 0 and opp_col in view.columns and not view.empty:
+    opp = view[opp_col]
+    view = view[opp.isna() | (opp >= float(min_opp))]
 if int(max_rsi_dist) < 70:
-    if "rsi_dist_30" not in view.columns:
+    rsi_col = "rsi_dist_70" if bear else "rsi_dist_30"
+    if rsi_col not in view.columns:
         view = view.iloc[0:0]
     else:
-        dist = view["rsi_dist_30"]
-        view = view[dist.isna() | (dist <= float(max_rsi_dist))]
-if require_eps_beat:
-    if "eps_beat" not in view.columns:
+        dist = view[rsi_col]
+        if bear:
+            view = view[dist.isna() | (dist >= -float(max_rsi_dist))]
+        else:
+            view = view[dist.isna() | (dist <= float(max_rsi_dist))]
+if require_eps:
+    eps_col = "eps_miss" if bear else "eps_beat"
+    if eps_col not in view.columns:
         view = view.iloc[0:0]
     else:
-        view = view[view["eps_beat"].fillna(False)]
+        view = view[view[eps_col].fillna(False)]
 if float(min_mktcap_bn) > 0:
     if "mktcap_bn" not in view.columns:
         view = view.iloc[0:0]
@@ -650,10 +800,13 @@ if meta:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Universe", f"{meta['n_uni']} tickers")
     c2.metric("Priced (≥210d)", meta["n_priced"])
-    c3.metric("Touching green iFVG", 0 if view.empty else int(view["ticker"].nunique()))
+    c3.metric(
+        "Touching red iFVG" if bear else "Touching green iFVG",
+        0 if view.empty else int(view["ticker"].nunique()),
+    )
     if show_lux:
         lux_n = 0 if view.empty else int(view.loc[view["lux_signal"], "ticker"].nunique())
-        c4.metric("LuxAlgo ▲ today", lux_n)
+        c4.metric("LuxAlgo ▼ today" if bear else "LuxAlgo ▲ today", lux_n)
     else:
         inside_n = 0 if view.empty else int(view.loc[view["inside_close"], "ticker"].nunique())
         c4.metric("Close inside zone", inside_n)
@@ -664,11 +817,11 @@ if meta:
         f"S&P {uni['n_sp500']}  ·  NDX {uni['n_ndx100']}  ·  union {uni['n_union']}  ·  "
         f"as-of {hits['date'].iloc[0]}  ·  lookback {int(meta.get('lookback', 0))}"
     )
-    if require_eps_beat and "eps_date" in hits.columns:
+    if require_eps and "eps_date" in hits.columns:
         n_src = int(hits.drop_duplicates("ticker")["eps_date"].notna().sum())
         if n_src == 0:
             st.warning(
-                "EPS surprise cache has no last print for these hits, so the beat filter skips all of them. "
+                "EPS surprise cache has no last print for these hits, so the EPS filter skips all of them. "
                 "Same as Flow B: missing estimate = skip."
             )
 
@@ -683,23 +836,41 @@ st.subheader(f"{view['ticker'].nunique()} names  ·  {len(view)} zone hits")
 if show_lux:
     lux_names = sorted(view.loc[view["lux_signal"], "ticker"].unique().tolist()) if "lux_signal" in view else []
     if lux_names:
-        st.success("LuxAlgo bullish signal (close back above the green iFVG) on last bar: **" + ", ".join(lux_names) + "**")
+        if bear:
+            st.success("LuxAlgo bearish signal (close back below the red iFVG) on last bar: **" + ", ".join(lux_names) + "**")
+        else:
+            st.success("LuxAlgo bullish signal (close back above the green iFVG) on last bar: **" + ", ".join(lux_names) + "**")
 if "sweep_in_zone" in view.columns:
     sweep_names = sorted(view.loc[view["sweep_in_zone"].fillna(False), "ticker"].unique().tolist())
     if sweep_names:
-        st.success("Sweep + close inside green iFVG on last bar: **" + ", ".join(sweep_names) + "**")
-st.caption(
-    "Green iFVG = inverted **bearish** FVG that has not been body-traded through the bottom. "
-    "Touch = as-of daily bar overlaps the zone. "
-    "`bear_above_%` = % from close up to the nearest red iFVG (blank = none above). "
-    "Sweep = last Low < prior 5-bar swing low and Close > that swing. "
-    "Sweep filter also requires Close inside the green iFVG. "
-    "`rsi_dist_30` = RSI(14) − 30 (negative = below 30). "
-    "`eps_surprise` = last reported Yahoo EPS vs consensus (Flow B rule: > 0 to pass). "
-    "`mktcap_bn` = Yahoo market cap ($B). "
-    "`adv_m` = 20-session average Close×Volume ($M). Missing liquidity fields fail the filter when it is on. "
-    "Midline is not a filter."
-)
+        zone = "red iFVG" if bear else "green iFVG"
+        st.success(f"Sweep + close inside {zone} on last bar: **" + ", ".join(sweep_names) + "**")
+if bear:
+    st.caption(
+        "Red iFVG = inverted **bullish** FVG that has not been body-traded through the top. "
+        "Touch = as-of daily bar overlaps the zone. "
+        "`green_below_%` = % from close down to the nearest green iFVG (blank = none below). "
+        "Sweep = last High > prior 5-bar swing high and Close < that swing. "
+        "Sweep filter also requires Close inside the red iFVG. "
+        "`rsi_dist_70` = RSI(14) − 70 (positive = above 70). "
+        "`eps_surprise` = last reported Yahoo EPS vs consensus (bear rule: < 0 to pass). "
+        "`mktcap_bn` = Yahoo market cap ($B). "
+        "`adv_m` = 20-session average Close×Volume ($M). Missing liquidity fields fail the filter when it is on. "
+        "Midline is not a filter."
+    )
+else:
+    st.caption(
+        "Green iFVG = inverted **bearish** FVG that has not been body-traded through the bottom. "
+        "Touch = as-of daily bar overlaps the zone. "
+        "`bear_above_%` = % from close up to the nearest red iFVG (blank = none above). "
+        "Sweep = last Low < prior 5-bar swing low and Close > that swing. "
+        "Sweep filter also requires Close inside the green iFVG. "
+        "`rsi_dist_30` = RSI(14) − 30 (negative = below 30). "
+        "`eps_surprise` = last reported Yahoo EPS vs consensus (Flow B rule: > 0 to pass). "
+        "`mktcap_bn` = Yahoo market cap ($B). "
+        "`adv_m` = 20-session average Close×Volume ($M). Missing liquidity fields fail the filter when it is on. "
+        "Midline is not a filter."
+    )
 show = view.copy()
 show.insert(0, "tag", show["ticker"].map(lambda t: TAG_SYM[_tag_of(t)]))
 show["sp500"] = show["sp500"].map({True: "Y", False: ""})
@@ -716,8 +887,15 @@ if "sweep_in_zone" in show.columns:
     show["sweep_in_zone"] = show["sweep_in_zone"].map({True: "Y", False: ""})
 if "eps_beat" in show.columns:
     show["eps_beat"] = show["eps_beat"].map({True: "Y", False: ""})
-# Raw USD fields stay in CSV; table shows $B / $M only.
-show = show.drop(columns=[c for c in ("market_cap", "adv_dollar") if c in show.columns])
+if "eps_miss" in show.columns:
+    show["eps_miss"] = show["eps_miss"].map({True: "Y", False: ""})
+# Hide the other side's columns so the table stays readable.
+hide = ["market_cap", "adv_dollar"]
+if bear:
+    hide += ["bear_above_%", "bear_bot", "bear_top", "swing_low", "rsi_dist_30", "eps_beat"]
+else:
+    hide += ["green_below_%", "green_bot", "green_top", "swing_high", "rsi_dist_70", "eps_miss"]
+show = show.drop(columns=[c for c in hide if c in show.columns])
 edited = st.data_editor(
     show,
     use_container_width=True,
@@ -739,9 +917,14 @@ edited = st.data_editor(
         "bear_above_%": st.column_config.NumberColumn(format="%.2f"),
         "bear_bot": st.column_config.NumberColumn(format="%.2f"),
         "bear_top": st.column_config.NumberColumn(format="%.2f"),
+        "green_below_%": st.column_config.NumberColumn(format="%.2f"),
+        "green_bot": st.column_config.NumberColumn(format="%.2f"),
+        "green_top": st.column_config.NumberColumn(format="%.2f"),
         "swing_low": st.column_config.NumberColumn(format="%.2f"),
+        "swing_high": st.column_config.NumberColumn(format="%.2f"),
         "rsi": st.column_config.NumberColumn(format="%.1f"),
         "rsi_dist_30": st.column_config.NumberColumn(format="%.1f"),
+        "rsi_dist_70": st.column_config.NumberColumn(format="%.1f"),
         "eps_surprise": st.column_config.NumberColumn(
             "EPS surprise",
             format="+0.0%",
@@ -766,7 +949,7 @@ csv_df.insert(0, "tag", csv_df["ticker"].map(lambda t: _tag_of(t)))
 st.download_button(
     "CSV",
     csv_df.to_csv(index=False).encode("utf-8"),
-    file_name="green_ifvg_hits.csv",
+    file_name="red_ifvg_hits.csv" if bear else "green_ifvg_hits.csv",
     mime="text/csv",
 )
 
@@ -785,21 +968,34 @@ with c_last:
         max_value=100,
         value=5,
         step=1,
-        help="Display cap only — last N green and last N red iFVGs, same as LuxAlgo Show Last. Scan still uses every active green.",
+        help=(
+            "Display cap only — last N green and last N red iFVGs, same as LuxAlgo Show Last. "
+            + ("Scan still uses every active red." if bear else "Scan still uses every active green.")
+        ),
     )
 frames = st.session_state["frames"]
 if pick in frames:
-    res = scan_ifvg(frames[pick], include_ohlc=True, **_scan_kwargs(meta))
+    res = scan_ifvg(frames[pick], include_ohlc=True, **_scan_kwargs(meta, mode="bear" if bear else "bull"))
     st.plotly_chart(
-        _chart(res, pick, show_last=int(show_last), show_signals=show_lux),
+        _chart(res, pick, show_last=int(show_last), show_signals=show_lux, bear=bear),
         use_container_width=True,
+    )
+    swing_note = (
+        "Pink dotted line is the prior 5-bar swing high used by the bear sweep filter. "
+        if bear
+        else "Gold dotted line is the prior 5-bar swing low used by the sweep filter. "
+    )
+    scan_note = (
+        "Scan table is unchanged (all active reds, proximity filter)."
+        if bear
+        else "Scan table is unchanged (all active greens, proximity filter)."
     )
     st.caption(
         "Two-tone boxes: original FVG color from **formed → inverted**, "
-        "flipped color from **inverted → now**. Red iFVGs included. "
+        "flipped color from **inverted → now**. Both green and red iFVGs shown. "
         + ("▲/▼ are LuxAlgo retest signals. " if show_lux else "")
-        + "Gold dotted line is the prior 5-bar swing low used by the sweep filter. "
-        "Scan table is unchanged (all active greens, proximity filter)."
+        + swing_note
+        + scan_note
     )
     shown_g = _last_n(res.get("green_zones", []), int(show_last))
     shown_r = _last_n(res.get("red_zones", []), int(show_last))
