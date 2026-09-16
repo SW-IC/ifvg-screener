@@ -92,11 +92,12 @@ with st.sidebar:
     require_eps = st.checkbox(
         "Require previous EPS surprise < 0" if bear else "Require previous EPS surprise > 0",
         value=False,
-        key="require_eps",
+        key="require_eps_bear" if bear else "require_eps_bull",
         help=(
             "Last reported Yahoo EPS surprise (the print already out) must be "
             + ("< 0. " if bear else "> 0. ")
-            + "Missing estimate = skip. Same source as Flow B. EPS vs consensus, not GAAP."
+            + "Missing estimate = skip. Same source as Flow B. EPS vs consensus, not GAAP. "
+            "Bull and bear do not share this checkbox."
         ),
     )
     max_gap = st.slider(
@@ -105,7 +106,11 @@ with st.sidebar:
         max_value=10.0,
         value=2.0,
         step=0.5,
-        help="0 = close must sit inside the zone. 2 = close can sit up to 2% outside the IFVG and still count as a touch (wicks).",
+        help=(
+            "0 = close must sit inside the zone (strictest, not off). "
+            "2 = close can sit up to 2% outside the IFVG and still count as a touch (wicks). "
+            "Unlike the min-% sliders, 0 here does not disable the filter."
+        ),
     )
     min_opp = st.slider(
         "Min % to nearest green iFVG" if bear else "Min % to nearest red iFVG",
@@ -145,10 +150,9 @@ with st.sidebar:
     min_adv_m = st.number_input(
         "Min 20d dollar ADV ($M)",
         min_value=0.0,
-        max_value=500.0,
         value=50.0,
         step=5.0,
-        help="Average of Close × Volume over the last 20 sessions (as-of bar). Keep ≥ this. 0 = off. Default $50M.",
+        help="Average of Close × Volume over the last 20 sessions (as-of bar). Keep ≥ this. 0 = off. Default $50M. No upper cap.",
     )
     nearest_only = st.checkbox("One row per ticker (nearest zone)", value=True)
     run = st.button("Scan", type="primary", use_container_width=True)
@@ -515,6 +519,105 @@ def _run_scan(
     return out.sort_values(cols, ascending=[False] * (len(cols) - 1) + [True])
 
 
+def _n_tickers(df: pd.DataFrame) -> int:
+    if df is None or df.empty or "ticker" not in df.columns:
+        return 0
+    return int(df["ticker"].nunique())
+
+
+def _apply_filters(
+    hits: pd.DataFrame,
+    *,
+    bear: bool,
+    only_signal: bool,
+    only_sweep: bool,
+    max_gap: float,
+    min_opp: float,
+    max_rsi_dist: int,
+    require_eps: bool,
+    min_mktcap_bn: float,
+    min_adv_m: float,
+    nearest_only: bool,
+    show_lux: bool,
+) -> tuple[pd.DataFrame, list[tuple[str, int]]]:
+    """Filter scan hits. `steps` is remaining unique tickers after each gate."""
+    view = hits.copy()
+    steps: list[tuple[str, int]] = [("Overlapping zone", _n_tickers(view))]
+    if only_signal:
+        view = view[view["lux_signal"]] if "lux_signal" in view.columns else view.iloc[0:0]
+        steps.append(("LuxAlgo signal today", _n_tickers(view)))
+    if only_sweep:
+        col = "sweep_in_zone" if "sweep_in_zone" in view.columns else "sweep"
+        view = view[view[col].fillna(False)] if col in view.columns else view.iloc[0:0]
+        steps.append(("Liquidity sweep + close inside", _n_tickers(view)))
+    view = view[view["dist_zone_%"] <= float(max_gap)]
+    gap_lbl = (
+        f"Max {float(max_gap):g}% gap"
+        + (" (close inside only)" if float(max_gap) == 0 else "")
+    )
+    steps.append((gap_lbl, _n_tickers(view)))
+    opp_col = "green_below_%" if bear else "bear_above_%"
+    if float(min_opp) > 0:
+        if opp_col in view.columns and not view.empty:
+            opp = view[opp_col]
+            view = view[opp.isna() | (opp >= float(min_opp))]
+        steps.append(
+            (
+                f"Min {float(min_opp):g}% to nearest {'green' if bear else 'red'} iFVG",
+                _n_tickers(view),
+            )
+        )
+    if int(max_rsi_dist) < 70:
+        rsi_col = "rsi_dist_70" if bear else "rsi_dist_30"
+        if rsi_col not in view.columns:
+            view = view.iloc[0:0]
+        else:
+            dist = view[rsi_col]
+            if bear:
+                view = view[dist.isna() | (dist >= -float(max_rsi_dist))]
+            else:
+                view = view[dist.isna() | (dist <= float(max_rsi_dist))]
+        steps.append((f"Max RSI distance {int(max_rsi_dist)}", _n_tickers(view)))
+    if require_eps:
+        eps_col = "eps_miss" if bear else "eps_beat"
+        if eps_col not in view.columns:
+            view = view.iloc[0:0]
+        else:
+            view = view[view[eps_col].fillna(False)]
+        steps.append(
+            ("EPS surprise < 0" if bear else "EPS surprise > 0", _n_tickers(view))
+        )
+    if float(min_mktcap_bn) > 0:
+        if "mktcap_bn" not in view.columns:
+            view = view.iloc[0:0]
+        else:
+            view = view[view["mktcap_bn"].notna() & (view["mktcap_bn"] >= float(min_mktcap_bn))]
+        steps.append((f"Min market cap ${float(min_mktcap_bn):g}B", _n_tickers(view)))
+    if float(min_adv_m) > 0:
+        if "adv_m" not in view.columns:
+            view = view.iloc[0:0]
+        else:
+            view = view[view["adv_m"].notna() & (view["adv_m"] >= float(min_adv_m))]
+        steps.append((f"Min 20d ADV ${float(min_adv_m):g}M", _n_tickers(view)))
+    if nearest_only and not view.empty:
+        view = (
+            view.sort_values(["ticker", "dist_zone_%", "age_inv"])
+            .groupby("ticker", as_index=False)
+            .first()
+        )
+    if not view.empty:
+        sort_cols = ["inside_close", "dist_zone_%", "ticker"]
+        sort_asc = [False, True, True]
+        if "sweep_in_zone" in view.columns:
+            sort_cols = ["sweep_in_zone", "inside_close", "dist_zone_%", "ticker"]
+            sort_asc = [False, False, True, True]
+        if show_lux and "lux_signal" in view.columns:
+            sort_cols = ["lux_signal"] + sort_cols
+            sort_asc = [False] + sort_asc
+        view = view.sort_values(sort_cols, ascending=sort_asc)
+    return view, steps
+
+
 def _attach_eps(hits: pd.DataFrame, fetch_missing: bool) -> pd.DataFrame:
     if hits is None or hits.empty:
         return hits
@@ -741,76 +844,42 @@ if hits.empty:
     )
     st.stop()
 
-view = hits.copy()
-if only_signal:
-    view = view[view["lux_signal"]]
-if only_sweep:
-    col = "sweep_in_zone" if "sweep_in_zone" in view.columns else "sweep"
-    view = view[view[col].fillna(False)]
-view = view[view["dist_zone_%"] <= float(max_gap)]
-opp_col = "green_below_%" if bear else "bear_above_%"
-if float(min_opp) > 0 and opp_col in view.columns and not view.empty:
-    opp = view[opp_col]
-    view = view[opp.isna() | (opp >= float(min_opp))]
-if int(max_rsi_dist) < 70:
-    rsi_col = "rsi_dist_70" if bear else "rsi_dist_30"
-    if rsi_col not in view.columns:
-        view = view.iloc[0:0]
-    else:
-        dist = view[rsi_col]
-        if bear:
-            view = view[dist.isna() | (dist >= -float(max_rsi_dist))]
-        else:
-            view = view[dist.isna() | (dist <= float(max_rsi_dist))]
-if require_eps:
-    eps_col = "eps_miss" if bear else "eps_beat"
-    if eps_col not in view.columns:
-        view = view.iloc[0:0]
-    else:
-        view = view[view[eps_col].fillna(False)]
-if float(min_mktcap_bn) > 0:
-    if "mktcap_bn" not in view.columns:
-        view = view.iloc[0:0]
-    else:
-        # Missing cap = fail (don't sneak illiquid/unknown names through)
-        view = view[view["mktcap_bn"].notna() & (view["mktcap_bn"] >= float(min_mktcap_bn))]
-if float(min_adv_m) > 0:
-    if "adv_m" not in view.columns:
-        view = view.iloc[0:0]
-    else:
-        view = view[view["adv_m"].notna() & (view["adv_m"] >= float(min_adv_m))]
-if nearest_only and not view.empty:
-    view = (
-        view.sort_values(["ticker", "dist_zone_%", "age_inv"])
-        .groupby("ticker", as_index=False)
-        .first()
-    )
-if not view.empty:
-    sort_cols = ["inside_close", "dist_zone_%", "ticker"]
-    sort_asc = [False, True, True]
-    if "sweep_in_zone" in view.columns:
-        sort_cols = ["sweep_in_zone", "inside_close", "dist_zone_%", "ticker"]
-        sort_asc = [False, False, True, True]
-    if show_lux and "lux_signal" in view.columns:
-        sort_cols = ["lux_signal"] + sort_cols
-        sort_asc = [False] + sort_asc
-    view = view.sort_values(sort_cols, ascending=sort_asc)
+view, filter_steps = _apply_filters(
+    hits,
+    bear=bear,
+    only_signal=only_signal,
+    only_sweep=only_sweep,
+    max_gap=max_gap,
+    min_opp=min_opp,
+    max_rsi_dist=max_rsi_dist,
+    require_eps=require_eps,
+    min_mktcap_bn=min_mktcap_bn,
+    min_adv_m=min_adv_m,
+    nearest_only=nearest_only,
+    show_lux=show_lux,
+)
 
 if meta:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Universe", f"{meta['n_uni']} tickers")
     c2.metric("Priced (≥210d)", meta["n_priced"])
-    c3.metric(
-        "Touching red iFVG" if bear else "Touching green iFVG",
-        0 if view.empty else int(view["ticker"].nunique()),
-    )
+    raw_n = _n_tickers(hits)
+    c3.metric("Touching red iFVG" if bear else "Touching green iFVG", raw_n)
     if show_lux:
-        lux_n = 0 if view.empty else int(view.loc[view["lux_signal"], "ticker"].nunique())
+        lux_n = 0 if hits.empty or "lux_signal" not in hits.columns else int(
+            hits.loc[hits["lux_signal"], "ticker"].nunique()
+        )
         c4.metric("LuxAlgo ▼ today" if bear else "LuxAlgo ▲ today", lux_n)
     else:
-        inside_n = 0 if view.empty else int(view.loc[view["inside_close"], "ticker"].nunique())
+        inside_n = (
+            0
+            if hits.empty or "inside_close" not in hits.columns
+            else int(hits.loc[hits["inside_close"], "ticker"].nunique())
+        )
         c4.metric("Close inside zone", inside_n)
-    st.caption(f"Scan time {meta['elapsed']:.1f}s")
+    st.caption(
+        f"Scan time {meta['elapsed']:.1f}s  ·  After filters: {_n_tickers(view)} names"
+    )
     uni = meta["uni"]
     st.caption(
         f"Constituents fetched {uni['fetched'][:10]}  ·  "
@@ -828,8 +897,16 @@ if meta:
 if view.empty:
     st.warning(
         "Hits exist, but none pass the current filters. "
-        "Loosen max % gap, liquidity mins, or uncheck the boxes."
+        "0% max gap = close must sit inside the zone (not off). "
+        "Uncheck EPS, lower min ADV / market cap, or raise max % gap."
     )
+    lines = []
+    prev = None
+    for label, n in filter_steps:
+        dropped = "" if prev is None else f" (−{prev - n})"
+        lines.append(f"- {label}: **{n}**{dropped}")
+        prev = n
+    st.markdown("\n".join(lines))
     st.stop()
 
 st.subheader(f"{view['ticker'].nunique()} names  ·  {len(view)} zone hits")
