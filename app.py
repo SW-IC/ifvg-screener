@@ -66,6 +66,15 @@ def _now_et() -> str:
     return pd.Timestamp.now(tz="America/New_York").strftime("%Y-%m-%d %H:%M ET")
 
 
+def _session_open() -> bool:
+    """True while the regular US session trades (holidays are not tracked)."""
+    now = pd.Timestamp.now(tz="America/New_York")
+    if now.weekday() >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    return 9 * 60 + 30 <= minutes < 16 * 60
+
+
 def _frames_for(tickers: tuple[str, ...], period: str, tag: str, live_on: bool, refresh_min: int):
     """Daily bars, with today's unfinished candle merged in when live price is on.
 
@@ -752,6 +761,7 @@ def _scan_and_store(
         "live": bool(live_on and live_bucket is not None),
         "live_bucket": live_bucket,
         "live_ts": live_ts,
+        "session_open": _session_open(),
         "refresh_min": int(refresh_min or 0),
         "scan_at": time.time(),
     }
@@ -963,7 +973,7 @@ if hits.empty:
         f"No names overlapping an active {zone_name} on {as_of_txt}"
         f" (lookback {lb})."
         + (
-            " Live price is on, so this is where today's unfinished candle stands right now."
+            " Live price is on, so this is where the last bar stands right now."
             if (meta or {}).get("live")
             else ""
         )
@@ -1013,8 +1023,9 @@ if meta:
         f"as-of {hits['date'].iloc[0]}  ·  lookback {int(meta.get('lookback', 0))}"
     )
     if meta.get("live") and meta.get("live_ts"):
+        state = "session in progress" if meta.get("session_open") else "last completed session"
         st.caption(
-            f"🟢 Live bar **{hits['date'].iloc[0]}** (unfinished candle) fetched {meta['live_ts']}  ·  "
+            f"🟢 Live bar **{hits['date'].iloc[0]}** ({state}) fetched {meta['live_ts']}  ·  "
             f"re-runs every {int(meta.get('refresh_min') or 0)} min while this tab stays open"
         )
     elif meta.get("live"):
