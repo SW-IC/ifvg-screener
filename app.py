@@ -17,8 +17,12 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import ifvg as _ifvg
+import prices as _prices
 
+# Reload from disk: a redeploy can re-run this file while the interpreter still
+# holds the previous module, which would hide newly added helpers.
 importlib.reload(_ifvg)
+importlib.reload(_prices)
 from earnings import ensure_surprise, load_surprise_cache, print_row
 from ifvg import scan_ifvg, universe_as_of
 from liquidity import attach_liquidity
