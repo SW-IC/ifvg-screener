@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib
 import json
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -21,7 +22,7 @@ importlib.reload(_ifvg)
 from earnings import ensure_surprise, load_surprise_cache, print_row
 from ifvg import scan_ifvg, universe_as_of
 from liquidity import attach_liquidity
-from prices import download_daily
+from prices import download_daily, download_live_bar, merge_live_bars
 from universe import load_universe
 
 st.set_page_config(page_title="iFVG screener", layout="wide")
@@ -34,6 +35,51 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+@st.cache_data(show_spinner="Loading index constituents…", ttl=86400)
+def _universe():
+    return load_universe()
+
+
+@st.cache_data(show_spinner="Downloading daily bars…", ttl=60 * 60 * 6)
+def _prices(tickers: tuple[str, ...], period: str, tag: str):
+    # _v2 = OHLCV (Volume kept for dollar ADV). Bumps Streamlit cache + parquet tag.
+    return download_daily(list(tickers), period=period, tag=f"{tag}_{period}_v2")
+
+
+def _live_bucket(minutes: int) -> int:
+    """Changes every `minutes`, which is what invalidates the live-price cache."""
+    return int(time.time() // max(60, int(minutes) * 60))
+
+
+@st.cache_data(show_spinner="Fetching live prices…", ttl=60 * 30, max_entries=16)
+def _live_bars(tickers: tuple[str, ...], bucket: int):
+    # `bucket` carries no data; it only rolls the cache over each refresh window.
+    return download_live_bar(list(tickers))
+
+
+def _now_et() -> str:
+    return pd.Timestamp.now(tz="America/New_York").strftime("%Y-%m-%d %H:%M ET")
+
+
+def _frames_for(tickers: tuple[str, ...], period: str, tag: str, live_on: bool, refresh_min: int):
+    """Daily bars, with today's unfinished candle merged in when live price is on.
+
+    Returns (frames, live_bucket, live_fetch_time) — the last two are None when
+    live price is off or the fetch failed (daily bars are then used as they are).
+    """
+    frames = _prices(tickers, period, tag)
+    if not live_on or not frames:
+        return frames, None, None
+    bucket = _live_bucket(refresh_min)
+    try:
+        live = _live_bars(tickers, bucket)
+    except Exception:
+        return frames, None, None
+    if not live:
+        return frames, None, None
+    return merge_live_bars(frames, live), bucket, _now_et()
+
 
 with st.sidebar:
     st.header("Scan")
@@ -52,15 +98,38 @@ with st.sidebar:
     )
     atr_multi = st.number_input("ATR multiplier", min_value=0.0, max_value=2.0, value=0.25, step=0.25)
     period = st.selectbox("History", ["2y", "1y", "5y"], index=0)
+    live_on = st.checkbox(
+        "Live price (today's unfinished candle)",
+        value=True,
+        help=(
+            "On: today's bar is re-fetched from Yahoo every few minutes, so the scan runs on the "
+            "in-progress candle instead of waiting for the close. Off: prices are whatever the "
+            "daily download returned (cached up to 6 hours)."
+        ),
+    )
+    if live_on:
+        refresh_min = st.number_input(
+            "Refresh every (minutes)",
+            min_value=1,
+            max_value=60,
+            value=5,
+            step=1,
+            help="How often the open page re-pulls live prices and re-runs the scan.",
+        )
+        if st.button("Refresh prices now", use_container_width=True):
+            _live_bars.clear()
+            st.rerun()
+    else:
+        refresh_min = 0
     lookback = st.number_input(
         "Lookback (sessions)",
         min_value=0,
         max_value=20,
-        value=1,
+        value=0,
         step=1,
         help=(
-            "Re-run the same filters as of N sessions ago. "
-            "0 = latest bar. 1 = previous session (default). "
+            "0 = latest bar (today's unfinished candle when live price is on). "
+            "1 = one session back, and so on. "
             "Uses the SPY calendar so every name shares one as-of date. Hit Scan."
         ),
     )
@@ -162,14 +231,24 @@ if bear:
     st.caption(
         "Daily candles overlapping an active **bearish inversion FVG** "
         "(LuxAlgo IFVG: inverted bullish FVG, still valid). "
-        "Universe = S&P 500 ∪ Nasdaq-100."
+        "Universe = S&P 500 ∪ Nasdaq-100. "
+        + (
+            "Today's candle is used as it stands, even before the session closes."
+            if live_on
+            else "Last completed bars from the daily download."
+        )
     )
 else:
     st.title("Green iFVG screener")
     st.caption(
         "Daily candles overlapping an active **bullish inversion FVG** "
         "(LuxAlgo IFVG: inverted bearish FVG, still valid). "
-        "Universe = S&P 500 ∪ Nasdaq-100."
+        "Universe = S&P 500 ∪ Nasdaq-100. "
+        + (
+            "Today's candle is used as it stands, even before the session closes."
+            if live_on
+            else "Last completed bars from the daily download."
+        )
     )
 
 UNI_KEY = {
@@ -177,18 +256,6 @@ UNI_KEY = {
     "S&P 500": "sp500",
     "Nasdaq-100": "ndx100",
 }
-
-
-@st.cache_data(show_spinner="Loading index constituents…", ttl=86400)
-def _universe():
-    return load_universe()
-
-
-@st.cache_data(show_spinner="Downloading daily bars…", ttl=60 * 60 * 6)
-def _prices(tickers: tuple[str, ...], period: str, tag: str):
-    # _v2 = OHLCV (Volume kept for dollar ADV). Bumps Streamlit cache + parquet tag.
-    return download_daily(list(tickers), period=period, tag=f"{tag}_{period}_v2")
-
 
 GREEN = "rgba(8,153,129,0.20)"
 RED = "rgba(242,54,69,0.20)"
@@ -638,12 +705,20 @@ def _attach_eps(hits: pd.DataFrame, fetch_missing: bool) -> pd.DataFrame:
     return hits.merge(extra, on="ticker", how="left")
 
 
-if run:
-    uni = _universe()
-    key = UNI_KEY[universe_choice]
+def _scan_and_store(
+    uni: dict,
+    key: str,
+    period: str,
+    atr_multi: float,
+    signal_pref: str,
+    lookback: int,
+    mode: str,
+    live_on: bool,
+    refresh_min: int,
+) -> None:
     tickers = tuple(uni[key])
     t0 = time.time()
-    frames = _prices(tickers, period, key)
+    frames, live_bucket, live_ts = _frames_for(tickers, period, key, live_on, refresh_min)
     members = {"sp500": set(uni["sp500"]), "ndx100": set(uni["ndx100"])}
     hits = _run_scan(
         frames,
@@ -651,55 +726,97 @@ if run:
         float(atr_multi),
         signal_pref,
         lookback=int(lookback),
-        mode="bear" if bear else "bull",
+        mode=mode,
     )
     hits = _attach_eps(hits, fetch_missing=True)
     as_of = universe_as_of(frames, int(lookback))
     hits = attach_liquidity(hits, frames, as_of=as_of, fetch_mktcap=True)
-    elapsed = time.time() - t0
     st.session_state["hits"] = hits
     st.session_state["frames"] = frames
     st.session_state["scan_meta"] = {
         "n_uni": len(tickers),
         "n_priced": len(frames),
-        "elapsed": elapsed,
-        "atr_multi": atr_multi,
+        "elapsed": time.time() - t0,
+        "atr_multi": float(atr_multi),
         "signal_pref": signal_pref,
         "lookback": int(lookback),
-        "mode": "bear" if bear else "bull",
+        "mode": mode,
         "as_of": None if as_of is None else pd.Timestamp(as_of).date().isoformat(),
         "uni": uni,
+        "uni_key": key,
+        "period": period,
+        "live": bool(live_on and live_bucket is not None),
+        "live_bucket": live_bucket,
+        "live_ts": live_ts,
+        "refresh_min": int(refresh_min or 0),
+        "scan_at": time.time(),
     }
+
+
+if run:
+    uni = _universe()
+    _scan_and_store(
+        uni,
+        UNI_KEY[universe_choice],
+        period,
+        float(atr_multi),
+        signal_pref,
+        int(lookback),
+        "bear" if bear else "bull",
+        live_on,
+        int(refresh_min),
+    )
 
 hits = st.session_state.get("hits")
 meta = st.session_state.get("scan_meta")
 want_mode = "bear" if bear else "bull"
-if (
-    hits is not None
-    and meta is not None
-    and (meta.get("mode") or "bull") != want_mode
-    and st.session_state.get("frames")
-):
-    frames = st.session_state["frames"]
-    uni = meta.get("uni") or {}
-    members = {"sp500": set(uni.get("sp500") or []), "ndx100": set(uni.get("ndx100") or [])}
-    t0 = time.time()
-    hits = _run_scan(
-        frames,
-        members,
-        float(meta.get("atr_multi", atr_multi)),
-        meta.get("signal_pref", signal_pref),
-        lookback=int(meta.get("lookback", lookback)),
-        mode=want_mode,
+
+
+def _rescan(*, mode: str | None = None, live: bool | None = None, refresh: int | None = None) -> None:
+    """Re-run the stored scan with fresh prices (keeps the stored scan settings)."""
+    md = st.session_state.get("scan_meta") or {}
+    _scan_and_store(
+        md.get("uni") or {},
+        md.get("uni_key") or UNI_KEY[universe_choice],
+        md.get("period") or period,
+        float(md.get("atr_multi", atr_multi)),
+        md.get("signal_pref", signal_pref),
+        int(md.get("lookback", lookback)),
+        mode or md.get("mode") or want_mode,
+        bool(md.get("live")) if live is None else bool(live),
+        int(md.get("refresh_min") or 0) if refresh is None else int(refresh),
     )
-    hits = _attach_eps(hits, fetch_missing=True)
-    as_of = universe_as_of(frames, int(meta.get("lookback", lookback)))
-    hits = attach_liquidity(hits, frames, as_of=as_of, fetch_mktcap=True)
-    meta = dict(meta)
-    meta["mode"] = want_mode
-    meta["elapsed"] = time.time() - t0
-    st.session_state["hits"] = hits
-    st.session_state["scan_meta"] = meta
+
+
+if hits is not None and meta is not None:
+    if (meta.get("mode") or "bull") != want_mode:
+        _rescan(mode=want_mode)
+    elif bool(meta.get("live")) != bool(live_on):
+        # Live price toggled: re-scan so the table matches the switch.
+        _rescan(live=live_on, refresh=int(refresh_min))
+    elif (
+        bool(live_on)
+        and int(refresh_min) > 0
+        and meta.get("live_bucket") != _live_bucket(int(refresh_min))
+    ):
+        _rescan(live=True, refresh=int(refresh_min))
+    hits = st.session_state.get("hits")
+    meta = st.session_state.get("scan_meta")
+
+if hits is not None and meta is not None and meta.get("live"):
+    _refresh_n = max(1, int(meta.get("refresh_min") or 5))
+
+    @st.fragment(run_every=timedelta(minutes=_refresh_n))
+    def _live_tick():
+        # Runs inline on every app rerun and again on each timer tick. Rerun the
+        # app only when the stored scan belongs to an older refresh window, so the
+        # prices and the scan stay current without spinning on the inline pass.
+        md = st.session_state.get("scan_meta") or {}
+        stale = md.get("live_bucket") != _live_bucket(_refresh_n)
+        if stale and (time.time() - float(md.get("scan_at") or 0.0)) > 30.0:
+            st.rerun(scope="app")
+
+    _live_tick()
 
 if hits is not None and not hits.empty and "sweep" not in hits.columns:
     frames = st.session_state.get("frames") or {}
@@ -841,6 +958,11 @@ if hits.empty:
     st.warning(
         f"No names overlapping an active {zone_name} on {as_of_txt}"
         f" (lookback {lb})."
+        + (
+            " Live price is on, so this is where today's unfinished candle stands right now."
+            if (meta or {}).get("live")
+            else ""
+        )
     )
     st.stop()
 
@@ -886,6 +1008,15 @@ if meta:
         f"S&P {uni['n_sp500']}  ·  NDX {uni['n_ndx100']}  ·  union {uni['n_union']}  ·  "
         f"as-of {hits['date'].iloc[0]}  ·  lookback {int(meta.get('lookback', 0))}"
     )
+    if meta.get("live") and meta.get("live_ts"):
+        st.caption(
+            f"🟢 Live bar **{hits['date'].iloc[0]}** (unfinished candle) fetched {meta['live_ts']}  ·  "
+            f"re-runs every {int(meta.get('refresh_min') or 0)} min while this tab stays open"
+        )
+    elif meta.get("live"):
+        st.caption(
+            "Live price is on, but the last fetch failed — this scan used the cached daily bars."
+        )
     if require_eps and "eps_date" in hits.columns:
         n_src = int(hits.drop_duplicates("ticker")["eps_date"].notna().sum())
         if n_src == 0:
@@ -925,7 +1056,7 @@ if "sweep_in_zone" in view.columns:
 if bear:
     st.caption(
         "Red iFVG = inverted **bullish** FVG that has not been body-traded through the top. "
-        "Touch = as-of daily bar overlaps the zone. "
+        "Touch = as-of bar overlaps the zone (today's unfinished candle when Live price is on). "
         "`green_below_%` = % from close down to the nearest green iFVG (blank = none below). "
         "Sweep = last High > prior 5-bar swing high and Close < that swing. "
         "Sweep filter also requires Close inside the red iFVG. "
@@ -938,7 +1069,7 @@ if bear:
 else:
     st.caption(
         "Green iFVG = inverted **bearish** FVG that has not been body-traded through the bottom. "
-        "Touch = as-of daily bar overlaps the zone. "
+        "Touch = as-of bar overlaps the zone (today's unfinished candle when Live price is on). "
         "`bear_above_%` = % from close up to the nearest red iFVG (blank = none above). "
         "Sweep = last Low < prior 5-bar swing low and Close > that swing. "
         "Sweep filter also requires Close inside the green iFVG. "
